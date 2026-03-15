@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use x509_cert::der::Decode;
 use std::{fs, io, iter::Iterator, sync::Arc};
 use tls_listener::{
     TlsListener,
@@ -10,13 +11,51 @@ use tls_listener::{
                 CertificateDer as Certificate, CertificateRevocationListDer as CRL, PrivateKeyDer as PrivateKey,
                 pem::PemObject,
             },
-            server::ServerConfig,
+            server::{ServerConfig, ServerConnection},
             version as tls_version,
         },
     },
 };
 
 use crate::net::SockAddr;
+
+pub(crate) struct TlsInfo {
+    pub server_cert_pem: Arc<String>,
+    pub client_cert_chain_pem: Vec<String>,
+    pub client_cert_name: Option<String>,
+    pub tls_version: Option<u16>,
+    pub cipher_suite: Option<u16>,
+}
+
+fn der_to_pem(der: &[u8]) -> String {
+    pem::encode(&pem::Pem::new("CERTIFICATE", der))
+}
+
+fn extract_subject_dn(der: &[u8]) -> Option<String> {
+    x509_cert::Certificate::from_der(der)
+        .ok()
+        .map(|cert| cert.tbs_certificate.subject.to_string())
+}
+
+pub(crate) fn extract_tls_info(conn: &ServerConnection, server_cert_pem: &Arc<String>) -> Arc<TlsInfo> {
+    let peer_certs = conn.peer_certificates();
+
+    let client_cert_chain_pem: Vec<String> = peer_certs
+        .map(|certs| certs.iter().map(|c| der_to_pem(c.as_ref())).collect())
+        .unwrap_or_default();
+
+    let client_cert_name = peer_certs
+        .and_then(|certs| certs.first())
+        .and_then(|c| extract_subject_dn(c.as_ref()));
+
+    Arc::new(TlsInfo {
+        server_cert_pem: server_cert_pem.clone(),
+        client_cert_chain_pem,
+        client_cert_name,
+        tls_version: conn.protocol_version().map(|v| u16::from(v)),
+        cipher_suite: conn.negotiated_cipher_suite().map(|cs| u16::from(cs.suite())),
+    })
+}
 
 pub(crate) fn resolve_protocol_versions(min_version: &str) -> Vec<&'static SupportedProtocolVersion> {
     match min_version {

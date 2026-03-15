@@ -490,6 +490,7 @@ macro_rules! gen_serve_match_tls {
                 $ctx,
                 crate::workers::$acceptor_tls {
                     opts: $self.config.tls_cfg().into(),
+                    server_cert_pem: $self.config.tls_opts.as_ref().unwrap().server_cert_pem.clone(),
                 },
                 $target,
                 $targetws

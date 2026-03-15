@@ -23,6 +23,7 @@ async def _server(
     ws=True,
     tls=False,
     tls_proto=None,
+    tls_client_verify=False,
     task_impl='asyncio',
     static_mount=False,
     static_rewrite=False,
@@ -48,6 +49,10 @@ async def _server(
 
         if tls_proto:
             kwargs['ssl_protocol_min'] = tls_proto
+
+        if tls_client_verify:
+            kwargs['ssl_ca'] = certs_path / 'ca.pem'
+            kwargs['ssl_client_verify'] = True
 
     if static_mount:
         if static_mount is True:

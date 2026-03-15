@@ -4,6 +4,9 @@ use hyper::{
     body::Bytes,
     header::{HeaderValue, SERVER as HK_SERVER},
 };
+use std::sync::Arc;
+
+use crate::tls::TlsInfo;
 
 pub(crate) type HTTPRequest = hyper::Request<hyper::body::Incoming>;
 pub(crate) type HTTPResponseBody = http_body_util::combinators::BoxBody<Bytes, anyhow::Error>;
@@ -14,16 +17,17 @@ pub(crate) const HV_SERVER: HeaderValue = HeaderValue::from_static("granian");
 #[derive(Clone)]
 pub(crate) enum HTTPProto {
     Plain,
-    Tls,
+    Tls(Arc<TlsInfo>),
 }
 
 impl HTTPProto {
     pub(crate) fn as_str(&self) -> &str {
         match self {
             Self::Plain => "http",
-            Self::Tls => "https",
+            Self::Tls(_) => "https",
         }
     }
+
 }
 
 pub(crate) fn response_404() -> HTTPResponse {

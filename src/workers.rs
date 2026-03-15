@@ -9,8 +9,8 @@ use super::asgi::serve::ASGIWorker;
 use super::metrics;
 use super::rsgi::serve::RSGIWorker;
 use super::tls::{
-    load_certs as tls_load_certs, load_crls as tls_load_crls, load_private_key as tls_load_pkey,
-    resolve_protocol_versions,
+    TlsInfo, extract_tls_info, load_certs as tls_load_certs, load_crls as tls_load_crls,
+    load_private_key as tls_load_pkey, resolve_protocol_versions,
 };
 use super::wsgi::serve::WSGIWorker;
 
@@ -118,6 +118,7 @@ pub(crate) struct WorkerTlsConfig {
     ca: Option<String>,
     crl: Vec<String>,
     client_verify: bool,
+    pub(crate) server_cert_pem: Arc<String>,
 }
 
 impl WorkerConfig {
@@ -146,14 +147,20 @@ impl WorkerConfig {
         metrics: (Option<u64>, Option<Py<crate::metrics::MetricsAggregator>>),
     ) -> Self {
         let tls_opts = match ssl_enabled {
-            true => Some(WorkerTlsConfig {
-                cert: ssl_cert.unwrap(),
-                key: (ssl_key.unwrap(), ssl_key_password),
-                proto: ssl_protocol_min.into(),
-                ca: ssl_ca,
-                crl: ssl_crl,
-                client_verify: ssl_client_verify,
-            }),
+            true => {
+                let cert_path = ssl_cert.unwrap();
+                let server_cert_pem =
+                    Arc::new(std::fs::read_to_string(&cert_path).expect("cannot read server certificate"));
+                Some(WorkerTlsConfig {
+                    cert: cert_path,
+                    key: (ssl_key.unwrap(), ssl_key_password),
+                    proto: ssl_protocol_min.into(),
+                    ca: ssl_ca,
+                    crl: ssl_crl,
+                    client_verify: ssl_client_verify,
+                    server_cert_pem,
+                })
+            }
             false => None,
         };
 
@@ -332,11 +339,12 @@ struct WorkerSvc<F, C, P> {
     disconnect_guard: Arc<tokio::sync::Notify>,
     addr_local: crate::net::SockAddr,
     addr_remote: crate::net::SockAddr,
+    tls_info: Option<Arc<TlsInfo>>,
     _proto: PhantomData<P>,
 }
 
 macro_rules! service_proto_fut {
-    ($proto:expr, $self:expr, $req:expr) => {{
+    (plain, $self:expr, $req:expr) => {{
         let fut = ($self.f)(
             $self.rt.clone(),
             $self.disconnect_guard.clone(),
@@ -344,14 +352,27 @@ macro_rules! service_proto_fut {
             $self.addr_local.clone(),
             $self.addr_remote.clone(),
             $req,
-            $proto,
+            crate::http::HTTPProto::Plain,
+        );
+        Box::pin(async move { Ok::<_, hyper::Error>(fut.await) })
+    }};
+    (tls, $self:expr, $req:expr) => {{
+        let proto = crate::http::HTTPProto::Tls($self.tls_info.clone().unwrap());
+        let fut = ($self.f)(
+            $self.rt.clone(),
+            $self.disconnect_guard.clone(),
+            $self.ctx.callback.clone(),
+            $self.addr_local.clone(),
+            $self.addr_remote.clone(),
+            $req,
+            proto,
         );
         Box::pin(async move { Ok::<_, hyper::Error>(fut.await) })
     }};
 }
 
 macro_rules! service_impl {
-    ($proto_marker:ty, $proto:expr) => {
+    ($proto_marker:ty, $proto_kind:tt) => {
         impl<F, Ret> hyper::service::Service<crate::http::HTTPRequest>
             for WorkerSvc<F, WorkerCTXBase<()>, $proto_marker>
         where
@@ -375,7 +396,7 @@ macro_rules! service_impl {
             type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
             fn call(&self, req: crate::http::HTTPRequest) -> Self::Future {
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto_kind, self, req)
             }
         }
 
@@ -416,7 +437,7 @@ macro_rules! service_impl {
                     });
                 }
 
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto_kind, self, req)
             }
         }
 
@@ -447,7 +468,7 @@ macro_rules! service_impl {
                     .metrics
                     .req_handled
                     .fetch_add(1, std::sync::atomic::Ordering::Release);
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto_kind, self, req)
             }
         }
 
@@ -501,14 +522,14 @@ macro_rules! service_impl {
                     });
                 }
 
-                service_proto_fut!($proto, self, req)
+                service_proto_fut!($proto_kind, self, req)
             }
         }
     };
 }
 
-service_impl!(WorkerMarkerPlain, crate::http::HTTPProto::Plain);
-service_impl!(WorkerMarkerTls, crate::http::HTTPProto::Tls);
+service_impl!(WorkerMarkerPlain, plain);
+service_impl!(WorkerMarkerTls, tls);
 
 macro_rules! conn_builder_h1 {
     ($opts:expr, $stream:expr, $svc:expr) => {
@@ -940,6 +961,7 @@ pub(crate) struct WorkerAcceptorTcpPlain {}
 #[derive(Clone)]
 pub(crate) struct WorkerAcceptorTcpTls {
     pub opts: Arc<tls_listener::rustls::rustls::ServerConfig>,
+    pub server_cert_pem: Arc<String>,
 }
 
 #[cfg(unix)]
@@ -950,6 +972,7 @@ pub(crate) struct WorkerAcceptorUdsPlain {}
 #[derive(Clone)]
 pub(crate) struct WorkerAcceptorUdsTls {
     pub opts: Arc<tls_listener::rustls::rustls::ServerConfig>,
+    pub server_cert_pem: Arc<String>,
 }
 
 pub(crate) trait WorkerAcceptor<L> {
@@ -962,7 +985,7 @@ pub(crate) trait WorkerAcceptor<L> {
 }
 
 macro_rules! acceptor_impl_stream {
-    ($proto_marker:ty, $sockwrap:expr, $stream:expr, $addr_remote:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr) => {{
+    ($proto_marker:ty, $sockwrap:expr, $stream:expr, $addr_remote:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr, $tls_info:expr) => {{
         let disconnect_guard = Arc::new(tokio::sync::Notify::new());
         let handle = $self.handle(disconnect_guard.clone());
         let svc = WorkerSvc {
@@ -972,6 +995,7 @@ macro_rules! acceptor_impl_stream {
             disconnect_guard,
             addr_local: $addr_local.clone(),
             addr_remote: $sockwrap($addr_remote),
+            tls_info: $tls_info,
             _proto: PhantomData::<$proto_marker>,
         };
         $tasks.spawn(handle.call(svc, $stream, $permit, $connsig));
@@ -986,7 +1010,7 @@ macro_rules! acceptor_impl_err {
 }
 
 macro_rules! acceptor_impl_match {
-    ($proto_marker:ty, $sockwrap:expr, $event:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr) => {{
+    ($proto_marker:ty, $sockwrap:expr, $event:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr, $tls_info:expr) => {{
         match $event {
             Ok((stream, addr_remote)) => acceptor_impl_stream!(
                 $proto_marker,
@@ -1000,7 +1024,8 @@ macro_rules! acceptor_impl_match {
                 $permit,
                 $connsig,
                 $target,
-                $ctx
+                $ctx,
+                $tls_info
             ),
             Err(err) => acceptor_impl_err!(err, $permit),
         }
@@ -1008,7 +1033,7 @@ macro_rules! acceptor_impl_match {
 }
 
 macro_rules! acceptor_impl_match_metrics {
-    ($proto_marker:ty, $sockwrap:expr, $event:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr) => {{
+    ($proto_marker:ty, $sockwrap:expr, $event:expr, $self:expr, $addr_local:expr, $rt:expr, $tasks:expr, $permit:expr, $connsig:expr, $target:expr, $ctx:expr, $tls_info:expr) => {{
         match $event {
             Ok((stream, addr_remote)) => {
                 $self
@@ -1027,7 +1052,8 @@ macro_rules! acceptor_impl_match_metrics {
                     $permit,
                     $connsig,
                     $target,
-                    $ctx
+                    $ctx,
+                    $tls_info
                 )
             }
             Err(err) => {
@@ -1042,7 +1068,7 @@ macro_rules! acceptor_impl_match_metrics {
 }
 
 macro_rules! acceptor_impl_loop {
-    ($proto_marker:ty, $sockwrap:expr, $matchi:ident, $self:expr, $sig:expr, $backpressure:expr, $listener:expr, $addr_local:expr) => {{
+    (plain, $sockwrap:expr, $matchi:ident, $self:expr, $sig:expr, $backpressure:expr, $listener:expr, $addr_local:expr) => {{
         let semaphore = Arc::new(tokio::sync::Semaphore::new($backpressure));
         let connsig = Arc::new(tokio::sync::Notify::new());
         let mut accept_loop = true;
@@ -1061,7 +1087,7 @@ macro_rules! acceptor_impl_loop {
                     let permit = semaphore.acquire_owned().await.unwrap();
                     (permit, $listener.accept().await)
                 } => $matchi!(
-                    $proto_marker,
+                    WorkerMarkerPlain,
                     $sockwrap,
                     event,
                     $self,
@@ -1071,8 +1097,58 @@ macro_rules! acceptor_impl_loop {
                     permit,
                     connsig,
                     target,
-                    ctx
+                    ctx,
+                    None
                 ),
+                _ = $sig.changed() => {
+                    accept_loop = false;
+                    connsig.notify_waiters();
+                }
+            }
+        }
+    }};
+    (tls, $sockwrap:expr, $matchi:ident, $self:expr, $sig:expr, $backpressure:expr, $listener:expr, $addr_local:expr, $server_cert_pem:expr) => {{
+        let semaphore = Arc::new(tokio::sync::Semaphore::new($backpressure));
+        let connsig = Arc::new(tokio::sync::Notify::new());
+        let mut accept_loop = true;
+
+        while accept_loop {
+            let rt = $self.rt.clone();
+            let tasks = $self.tasks.clone();
+            let target = $self.target;
+            let ctx = $self.ctx.clone();
+            let semaphore = semaphore.clone();
+            let connsig = connsig.clone();
+            let server_cert_pem = $server_cert_pem.clone();
+
+            tokio::select! {
+                biased;
+                (permit, event) = async {
+                    let permit = semaphore.acquire_owned().await.unwrap();
+                    (permit, $listener.accept().await)
+                } => {
+                    let tls_info = match &event {
+                        Ok((stream, _)) => {
+                            let (_, conn) = stream.get_ref();
+                            Some(extract_tls_info(conn, &server_cert_pem))
+                        }
+                        Err(_) => None,
+                    };
+                    $matchi!(
+                        WorkerMarkerTls,
+                        $sockwrap,
+                        event,
+                        $self,
+                        $addr_local,
+                        rt,
+                        tasks,
+                        permit,
+                        connsig,
+                        target,
+                        ctx,
+                        tls_info
+                    )
+                },
                 _ = $sig.changed() => {
                     accept_loop = false;
                     connsig.notify_waiters();
@@ -1113,7 +1189,7 @@ macro_rules! acceptor_impl {
                 let listener = <$listenero>::from_std(listener).unwrap();
                 let addr_local = $sockwrap(listener.local_addr().unwrap());
 
-                acceptor_impl_loop!(WorkerMarkerPlain, $sockwrap, acceptor_impl_match, self, sig, backpressure, listener, addr_local)
+                acceptor_impl_loop!(plain, $sockwrap, acceptor_impl_match, self, sig, backpressure, listener, addr_local)
             }
         }
 
@@ -1145,9 +1221,10 @@ macro_rules! acceptor_impl {
                 backpressure: usize,
             ) {
                 let tls_cfg = self.acceptor.opts.clone();
+                let server_cert_pem = self.acceptor.server_cert_pem.clone();
                 let (mut tls_listener, addr_local) = $tlswrap(tls_cfg, listener).unwrap();
 
-                acceptor_impl_loop!(WorkerMarkerTls, $sockwrap, acceptor_impl_match, self, sig, backpressure, tls_listener, addr_local)
+                acceptor_impl_loop!(tls, $sockwrap, acceptor_impl_match, self, sig, backpressure, tls_listener, addr_local, server_cert_pem)
             }
         }
 
@@ -1180,7 +1257,7 @@ macro_rules! acceptor_impl {
                 let listener = <$listenero>::from_std(listener).unwrap();
                 let addr_local = $sockwrap(listener.local_addr().unwrap());
 
-                acceptor_impl_loop!(WorkerMarkerPlain, $sockwrap, acceptor_impl_match_metrics, self, sig, backpressure, listener, addr_local)
+                acceptor_impl_loop!(plain, $sockwrap, acceptor_impl_match_metrics, self, sig, backpressure, listener, addr_local)
             }
         }
 
@@ -1212,9 +1289,10 @@ macro_rules! acceptor_impl {
                 backpressure: usize,
             ) {
                 let tls_cfg = self.acceptor.opts.clone();
+                let server_cert_pem = self.acceptor.server_cert_pem.clone();
                 let (mut tls_listener, addr_local) = $tlswrap(tls_cfg, listener).unwrap();
 
-                acceptor_impl_loop!(WorkerMarkerTls, $sockwrap, acceptor_impl_match_metrics, self, sig, backpressure, tls_listener, addr_local)
+                acceptor_impl_loop!(tls, $sockwrap, acceptor_impl_match_metrics, self, sig, backpressure, tls_listener, addr_local, server_cert_pem)
             }
         }
     };

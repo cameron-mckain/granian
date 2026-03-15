@@ -20,7 +20,7 @@ macro_rules! scope_set {
 }
 
 macro_rules! build_scope_common {
-    ($py:expr, $scope:ident, $req:expr, $server:expr, $client:expr, $scheme:expr, $proto:expr) => {
+    ($py:expr, $scope:ident, $req:expr, $server:expr, $client:expr, $scheme_str:expr, $proto:expr) => {
         let raw_path = $req.uri.path();
         let query_string = $req.uri.query().unwrap_or("");
         let path = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
@@ -67,7 +67,7 @@ macro_rules! build_scope_common {
         );
         scope_set!($py, $scope, "server", ($server.ip(), $server.port().to_string()));
         scope_set!($py, $scope, "client", ($client.ip(), $client.port().to_string()));
-        scope_set!($py, $scope, "scheme", $scheme);
+        scope_set!($py, $scope, "scheme", $scheme_str);
         scope_set!($py, $scope, "path", &path);
         scope_set!($py, $scope, "raw_path", PyBytes::new($py, raw_path.as_bytes()));
         scope_set!($py, $scope, "query_string", PyBytes::new($py, query_string.as_bytes()));
@@ -88,6 +88,30 @@ macro_rules! build_scope_common {
 }
 
 #[inline]
+fn apply_tls_extension(py: Python, scope: &Bound<PyDict>, scheme: &HTTPProto) -> PyResult<()> {
+    if let HTTPProto::Tls(tls_info) = scheme {
+        let extensions = PyDict::new(py);
+        extensions.set_item("http.response.pathsend", PyDict::new(py))?;
+        extensions.set_item("websocket.http.response", PyDict::new(py))?;
+
+        let tls_ext = PyDict::new(py);
+        tls_ext.set_item("server_cert", &*tls_info.server_cert_pem)?;
+        tls_ext.set_item(
+            "client_cert_chain",
+            PyList::new(py, tls_info.client_cert_chain_pem.iter())?,
+        )?;
+        tls_ext.set_item("client_cert_name", tls_info.client_cert_name.as_deref())?;
+        tls_ext.set_item("client_cert_error", py.None())?;
+        tls_ext.set_item("tls_version", tls_info.tls_version)?;
+        tls_ext.set_item("cipher_suite", tls_info.cipher_suite)?;
+        extensions.set_item("tls", tls_ext)?;
+
+        scope.set_item(pyo3::intern!(py, "extensions"), extensions)?;
+    }
+    Ok(())
+}
+
+#[inline]
 pub(super) fn build_scope_http(
     py: Python,
     req: request::Parts,
@@ -97,6 +121,7 @@ pub(super) fn build_scope_http(
 ) -> PyResult<Bound<PyDict>> {
     build_scope_common!(py, scope, req, server, client, scheme.as_str(), "http");
     scope_set!(py, scope, "method", req.method.as_str());
+    apply_tls_extension(py, &scope, &scheme)?;
     Ok(scope)
 }
 
@@ -110,7 +135,7 @@ pub(super) fn build_scope_ws(
 ) -> PyResult<Bound<PyDict>> {
     let ws_scheme = match scheme {
         HTTPProto::Plain => "ws",
-        HTTPProto::Tls => "wss",
+        HTTPProto::Tls(_) => "wss",
     };
     build_scope_common!(py, scope, req, server, client, ws_scheme, "websocket");
     scope_set!(
@@ -127,5 +152,6 @@ pub(super) fn build_scope_ws(
         )
         .unwrap()
     );
+    apply_tls_extension(py, &scope, &scheme)?;
     Ok(scope)
 }

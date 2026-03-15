@@ -276,8 +276,7 @@ class AbstractServer(Generic[WT]):
         ctx.load_cert_chain(str(cert.resolve()), str(key.resolve()), password)
         #: build ctx
         if client_verify and not ca:
-            logger.warning('SSL client verification requires a CA certificate, ignoring')
-            client_verify = False
+            raise ConfigurationError('SSL client verification requires a CA certificate (--ssl-ca)')
         self.ssl_ctx = (
             True,
             str(cert.resolve()),
